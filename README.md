@@ -1,5 +1,5 @@
 # About
-Implementation of 
+Implementation of SpTMM: Multiplying Ternary Matrix Without Multiplication for Transformers
 
 # Reproduction instruction
 
