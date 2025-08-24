@@ -16,9 +16,11 @@ cd work
 mkdir build && cd build
 source ../script/make_ccc.sh
 
-# Step3: Run SpTMM and SpTMM-delta
+# Step3: Run SpTMM, SpTMM-delta, cuBLAS, and bitnet.cpp
 ./ccc -row_split3 128 -M=1 -K=6912 -N=2560 -S=4096 -iter=100000 # SpTMM with Split-K=128
 ./ccc -row_split_delta2 128 -M=1 -K=6912 -N=2560 -S=4096 -iter=100000 # SpTMM-delta with Split-K=128
+./ccc -cu_blas -M=1 -K=6912 -N=2560 -S=4096 -iter=100000 # SpTMM with Split-K=128
+./ccc -i2s -M=1 -K=6912 -N=2560 -S=4096 -iter=100000 # SpTMM with Split-K=128
 ```
 
 

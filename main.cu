@@ -23,9 +23,12 @@
 
 
 #include "macro.cuh"
+#include "bitnet_kernels.cuh"
 
+DEFINE_bool(cu_blas, false, "Run cuBLAS method when true");
 DEFINE_uint64(row_split3, 0, "Run Row-wise SplitS 3 method with specified split size");
 DEFINE_uint64(row_split_delta2, 0, "Run Row-wise Split Delta method 2 with specified split size");
+DEFINE_bool(i2s, false, "Run I2_S method when true");
 
 DEFINE_uint64(M, 32L, "M"); // batch size
 DEFINE_uint64(K, 3072L, "K"); // hidden size
@@ -104,6 +107,15 @@ void check(T result, char const *const func, const char *const file,
     }                                                       \
   } while (0)
 
+void checkCublasError(cublasStatus_t status, int line)
+{
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("Cublas Error at line %d, Error Code: %d\n", line, status);
+        exit(EXIT_FAILURE);
+    }
+}
+
+
 /**
  * Prepare both W_mat and W_map before the measurement.
  */
@@ -180,6 +192,61 @@ __global__ void prepareW_map(
             AT(W_MAJOR)(W_map_negative_delta2_d, ctx.s / 2, ctx.n, i, col)
                 = AT(W_MAJOR) (W_map_negative, ctx.s / 2, ctx.n, i, col) - AT(W_MAJOR) (W_map_negative, ctx.s / 2, ctx.n, i-1, col);
         }
+    }
+}
+
+/**
+ * prepare I2_S format weight
+ * */
+__global__ void prepareW_i2s(int8_t *W_i2s, ctx ctx){
+    u_int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    u_int64_t col = tid;
+    if(col >= ctx.n){
+        // this thread won't work for init
+        return;
+    }
+
+
+    char tmp[16];
+    for(int i = 0; i < 16; i++) {
+        tmp[i] = 0;
+    }
+    for(int i = 0; i < 4; i++){
+        tmp[i] = -1;
+    }
+    for(int i = 0; i < 4; i++){
+        tmp[i] = 1;
+    }
+
+    uint32_t seed = (uint32_t) (0xCAFEBABE ^ (col / 32));
+
+    for(int i = 16 - 1; i > 0; --i){
+        int j = xorshift32(&seed) % (i + 1);
+        char t = tmp[i];
+        tmp[i] = tmp[j];
+        tmp[j] = t;
+    }
+
+    // +2
+    for(int i = 0; i < 16; i++){
+        tmp[i] += 2;
+    }
+    char shuffle_tmp[16];
+    for(int i = 0; i < 4; i++){
+        for(int j = 0; j < 4; j++){
+            int in_pos = 3 - i;
+            int out_pos = 3 - j;
+            shuffle_tmp[out_pos * 4 + in_pos] = tmp[i * 4 + j];
+        }
+    }
+    // to int32
+    int code = 0;
+    for(int i = 0; i < 16; i++){
+        code |= shuffle_tmp[i] << (30 - i*2);
+    }
+
+    for(unsigned i = 0; i < ctx.k; i+=16){
+        reinterpret_cast<int *>(&AT(MAJOR_COL) (W_i2s, ctx.k / 4, ctx.n, i/4, col))[0] = code;
     }
 }
 
@@ -404,9 +471,6 @@ int main(int argc, char** argv){
 
 float ms = 0;
 char *W_d = nullptr;
-
-
-char *W_work_d;
 unsigned short *W_map_d;
 unsigned short *W_map_negative_d;
 unsigned short *W_map_split_base_d;
@@ -422,10 +486,10 @@ char  *W_vcsc_values_d;
 unsigned short  *W_vcsc_counts_d;
 unsigned short  *W_vcsc_indices_d;
 
-if( FLAGS_row_split3 || FLAGS_row_split_delta2 ){
+if( FLAGS_cu_blas || FLAGS_row_split3 || FLAGS_row_split_delta2){
     checkCudaErrors(cudaMalloc((void**) &W_map_d, sizeof(unsigned short) * (S / 2) * N));
     checkCudaErrors(cudaMalloc((void**) &W_map_negative_d, sizeof(unsigned short) * (S / 2) * N));
-    checkCudaErrors(cudaMalloc((void**) &W_work_d, sizeof(char) * K * N));
+    checkCudaErrors(cudaMalloc((void**) &W_d, sizeof(char) * K * N));
 
     // for 128 split method
     checkCudaErrors(cudaMalloc((void**) &W_map_split_base_d, sizeof(unsigned short) * 128 * N));
@@ -444,13 +508,46 @@ if( FLAGS_row_split3 || FLAGS_row_split_delta2 ){
     checkCudaErrors(cudaMalloc((void**) &W_vcsc_counts_d, sizeof(unsigned short) * 2 * N)); // only -1 & 1
     checkCudaErrors(cudaMalloc((void**) &W_vcsc_indices_d, sizeof(unsigned short) * S * N)); // only -1 & 1
 
-    prepareW_map<<<N/16, 16>>>(W_work_d, W_map_d, W_map_negative_d, W_map_split_base_d, W_map_split_negative_base_d,
+    prepareW_map<<<N/16, 16>>>(W_d, W_map_d, W_map_negative_d, W_map_split_base_d, W_map_split_negative_base_d,
                                W_map_split_delta_d, W_map_split_negative_delta_d, W_map_delta2_d, W_map_negative_delta2_d, W_map_delta_warp_acc_d, W_map_negative_delta_warp_acc_d,
                                W_vcsc_values_d, W_vcsc_counts_d, W_vcsc_indices_d,
                                 ctx_v);
     cudaDeviceSynchronize();
 }
 
+
+if(FLAGS_cu_blas){
+    assert(X_MAJOR == MAJOR_COL);
+    assert(W_MAJOR == MAJOR_COL);
+    assert(C_MAJOR == MAJOR_COL);
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    cudaDeviceSynchronize();
+
+    int alpha = 1, beta = 0;
+
+    ms = measureKernel([&]() {
+        for (size_t i = 0; i < FLAGS_iter; i++) {
+            cublasStatus_t cublas_status = cublasGemmEx(
+                    handle,
+                    CUBLAS_OP_N,
+                    CUBLAS_OP_N,
+                    M, N, K,
+                    &alpha,
+                    X_d, CUDA_R_8I, M,
+                    W_d, CUDA_R_8I, K,
+                    &beta,
+                    c_d, CUDA_R_32I, M,
+                    CUBLAS_COMPUTE_32I,
+                    CUBLAS_GEMM_DEFAULT);
+            checkCublasError(cublas_status, __LINE__);
+            checkCudaErrors(cudaDeviceSynchronize());
+        }
+    });
+    std::cout << ms / ((float) FLAGS_iter) << std::endl;
+}
 
 if(FLAGS_row_split3 > 0) {
     ms = measureKernel([&]() {
@@ -924,6 +1021,60 @@ if(FLAGS_row_split_delta2 > 0) {
                 default: {
                     STRICT_ASSERT(false, "Wrong split size");
                 }
+            }
+
+            checkCudaErrors(cudaDeviceSynchronize());
+        }
+    });
+    std::cout << ms / ((float) FLAGS_iter) << std::endl;
+}
+
+int8_t *W_i2s_d;
+
+if(FLAGS_i2s){
+    STRICT_ASSERT(W_MAJOR == MAJOR_COL, "W must be col-major!\n");
+
+    checkCudaErrors(cudaMalloc((void**) &W_i2s_d, K/ 4 * N));
+    cudaMemset(W_i2s_d, 0, K / 4 * N);
+    prepareW_i2s<<<N / 16, 16>>>(W_i2s_d, ctx_v);
+    cudaDeviceSynchronize();
+
+    cudaStream_t default_stream = 0;
+
+    ms = measureKernel([&]() {
+        for (size_t i = 0; i < FLAGS_iter; i++) {
+            if(M == 1 && N == 2560 && K == 2560){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 2560, 2560, 8, 16><<< dim3(160, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 2560 && K == 6912){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 2560, 6912, 8, 16><<< dim3(160, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 3200 && K == 10240){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 3200, 10240, 8, 16><<< dim3(200, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 1280 && K == 10240){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 1280, 10240, 8, 16><<< dim3(80, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 640 && K == 10240){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 640, 10240, 8, 16><<< dim3(40, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 2560 && K == 10240){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 2560, 10240, 8, 16><<< dim3(160, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 13824 && K == 2560){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 13824, 2560, 8, 16><<< dim3(864, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 1024 && K == 4096){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 1024, 4096, 8, 16><<< dim3(64, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 1024 && K == 8192){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 1024, 8192, 8, 16><<< dim3(64, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 1024 && K == 10240){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 1024, 8192, 8, 16><<< dim3(64, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 768 && K == 8192){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 768, 8192, 8, 16><<< dim3(48, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 6912 && K == 2560){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 6912, 2560, 8, 16><<< dim3(432, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 640 && K == 2560){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 640, 2560, 8, 16><<< dim3(40, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 1 && N == 3840 && K == 2560){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 3840, 2560, 8, 16><<< dim3(240, 1, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else if (M == 16 && N == 2560 && K == 6912){
+                checkKernelErrors((ladder_int8xint2_kernel<1, 2560, 6912, 8, 16><<< dim3(864, 16, 1), dim3(8,16,1), 0, default_stream >>>((int8_t *)X_d, W_i2s_d, c_d)));
+            }else{
+                STRICT_ASSERT(false, "Wrong MKN size");
             }
 
             checkCudaErrors(cudaDeviceSynchronize());
